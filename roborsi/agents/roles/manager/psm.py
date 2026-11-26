@@ -383,8 +383,11 @@ class PsmManager:
         )
         if result["reply"]["outcome"] == "ok":
             retained = result.get("details")
-            if isinstance(retained, dict) and retained.get("kind") == "run_status":
-                return _safe_run(retained, caller, "status", run_id, read_only=True)
+            if isinstance(retained, dict):
+                if retained.get("kind") == "run_result":
+                    return _safe_run(retained, caller, "result", run_id, read_only=True)
+                if retained.get("kind") == "run_status":
+                    return _safe_run(retained, caller, "status", run_id, read_only=True)
         return status
 
     @staticmethod

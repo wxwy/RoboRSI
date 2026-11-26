@@ -26,6 +26,7 @@ from typing import Any
 
 SHIPPED_ROOT = Path(__file__).resolve().parent
 PSM_NAMESPACE = "psm_wma"
+PSM_READ_SKILL = "psm_wma_spatial_memory"
 
 
 def user_root() -> Path:
@@ -235,28 +236,35 @@ def discover_compounds(task: str) -> list[Skill]:
     return out
 
 
-def run(name: str, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the optional ``policy.py:run(**kwargs)`` next to a skill's SKILL.md.
-
-    Returns a dict from the policy. If the skill has no ``policy.py``, raises.
-    Skills without a policy are still useful: the agent reads SKILL.md and
-    composes other tools on its own.
-    """
-    sk = get(name)
-    if sk is None:
-        raise ValueError(f"unknown skill '{name}'")
-    policy_py = sk.path.parent / "policy.py"
-    if not policy_py.exists():
-        raise RuntimeError(
-            f"skill '{name}' has no policy.py — read SKILL.md and compose tools instead"
-        )
+def _load_policy(skill: Skill):
     import importlib.util
-    spec = importlib.util.spec_from_file_location(f"_skill_{name}_policy", policy_py)
+
+    path = skill.path.parent / "policy.py"
+    if not path.exists():
+        raise RuntimeError(f"skill '{skill.name}' has no policy.py — read SKILL.md and compose tools instead")
+    spec = importlib.util.spec_from_file_location(f"_skill_{skill.name}_policy", path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load {policy_py}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    entry = getattr(mod, "run", None)
+        raise RuntimeError(f"could not load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_psm_read_policy():
+    """Load the pinned C4 policy from the shipped namespace at bridge startup."""
+    skill = get_ns(PSM_READ_SKILL, PSM_NAMESPACE)
+    root = SHIPPED_ROOT / "base" / PSM_NAMESPACE
+    if skill is None or not (skill.path.parent / "policy.py").resolve().is_relative_to(root):
+        raise RuntimeError(f"missing shipped PSM skill {PSM_READ_SKILL!r}")
+    return _load_policy(skill)
+
+
+def run(name: str, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the optional ``policy.py:run(**kwargs)`` next to a skill's SKILL.md."""
+    skill = get(name)
+    if skill is None:
+        raise ValueError(f"unknown skill '{name}'")
+    entry = getattr(_load_policy(skill), "run", None)
     if entry is None:
-        raise RuntimeError(f"{policy_py} has no ``run()`` entry point")
+        raise RuntimeError(f"skill '{name}' policy.py has no ``run()`` entry point")
     return entry(**kwargs) or {}

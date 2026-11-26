@@ -9,15 +9,16 @@ import threading
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from urllib.parse import quote
 
 from roborsi.agents.roles.manager.psm_evidence import (
-    projection_sha, public_id, publication as project_publication, scene_projection,
+    projection_sha, public_id, publication as project_publication, scene_projection, w4_details,
 )
 from roborsi.agents.sessions import persistent_agent
 from roborsi.agents.sessions.psm import ApprovedImage, ReadTool, ScopedRole
 from roborsi.embodied.agent_loop.psm_backend import Caller, RUN_FIELDS, TASK_FIELDS, WORLD_FIELDS
-from roborsi.embodied.skills import PSM_NAMESPACE, discover_ns
+from roborsi.embodied.skills import PSM_NAMESPACE, discover_ns, load_psm_read_policy
 from roborsi.runtime_mode import use_run_mode
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
@@ -35,6 +36,14 @@ _REASONS = {"ordinary_stop", "official_latch", "official_terminal", "budget_exha
             "action_outcome_unknown", "physical_unknown", "user_budget_exhausted",
             "action_steps", "wall_ms", "environment_terminal_partial_chunk"}
 _STATES = {"accepted", "running", "stopping", "ended"}
+_SPATIAL_PARAMS = {
+    "scene_overview": {"include_robot_pose"},
+    "rooms": {"selector", "limit"},
+    "entities": {"selector", "room_uid", "source_part", "role", "limit"},
+    "relation": {"source", "relation", "target"},
+    "list_views": {"entity_id", "limit"},
+    "initial_context": set(),
+}
 _QA_PROMPT = (
     "You are RoboRSI's Frozen Manager. Reply in the operator's language. "
     "Use only the attached read capabilities and distinguish uncertainty. "
@@ -55,6 +64,15 @@ def _normalized(text: str) -> str:
 class Route:
     action: str
     argument: str = ""
+
+
+@dataclass(frozen=True)
+class SpatialEvidence:
+    publication: dict
+    request: dict
+    operation: str
+    parameters: dict
+    artifact: dict
 
 
 def route(text: str, current: dict) -> Route:
@@ -165,11 +183,13 @@ class PsmManager:
         self.config = config
         self._recent: dict[Caller, str] = {}
         self._monitor_lock = threading.Lock()
-        self._evidence: OrderedDict[tuple[Caller, str], tuple[dict, dict]] = OrderedDict()
+        self._evidence: OrderedDict[tuple[Caller, str], SpatialEvidence] = OrderedDict()
+        self._read_policy = load_psm_read_policy()
         skills = discover_ns(PSM_NAMESPACE)
         self._skills = {skill.name: skill.description[:240] for skill in skills}
+        skill_policy_sha = hashlib.sha256(Path(self._read_policy.__file__).read_bytes()).hexdigest()
         self._release = hashlib.sha256(
-            json.dumps([_QA_PROMPT, sorted((skill.name, skill.description, skill.body) for skill in skills), {
+            json.dumps([_QA_PROMPT, skill_policy_sha, sorted((skill.name, skill.description, skill.body) for skill in skills), {
                 role: asdict(model) for role, model in config.models.items()
             }], sort_keys=True).encode()
         ).hexdigest()
@@ -199,7 +219,10 @@ class PsmManager:
             if entity_id is not None:
                 if "spatial.read" not in current["capabilities"]:
                     return _error("forbidden", "submit")
-                view, _ = self._read_scene({}, f"Resolve current public entity {entity_id}.", caller)
+                view, _ = self._read_scene(
+                    {"operation": "entities", "parameters": {"selector": entity_id}},
+                    f"Resolve current public entity {entity_id}.", caller,
+                )
                 if view["outcome"] != "ok" or entity_id not in view["entity_ids"]:
                     return _error("unbound", "submit")
                 request["entity_hints"] = [{
@@ -233,12 +256,27 @@ class PsmManager:
             stored = self._evidence.get((caller, digest))
         if not stored:
             return None
-        source, value = stored
-        request = {"kind": "spatial_read", **caller.world, "question": "Resolve approved evidence.",
-                   "requested_frame": source["frame"]}
-        if project_publication(self.host.publication(request, caller.restrict("spatial.read")), source) is None:
+        request = {**stored.request, "requested_frame": stored.publication["frame"]}
+        allowed = ("observe", "spatial.read") if stored.operation == "view" else ("spatial.read",)
+        caller = caller.restrict(*allowed)
+        if caller.capabilities != frozenset(allowed):
             return None
-        return value
+        receipt = self.host.publication(request, caller)
+        if project_publication(receipt, stored.publication) is None:
+            return None
+        reader = self.host.read_queries(caller, request)
+        resolved = self._read_policy.resolve_projected_evidence(
+            reader, stored.artifact, operation=stored.operation,
+            parameters={**stored.parameters, "requested_frame": stored.publication["frame"]},
+            include_native=True,
+        )
+        reply = resolved["reply"]
+        if (reply.get("outcome") not in ("ok", "ambiguous")
+                or resolved.get("environment_id") != caller.environment_id
+                or project_publication(receipt, reply.get("publication")) is None):
+            return None
+        value = self._scene_value(resolved.get("details"), caller, stored.publication)
+        return value if value and projection_sha(value) == digest else None
 
     def monitor(self, caller: Caller, current: dict) -> dict:
         view = {
@@ -272,24 +310,29 @@ class PsmManager:
         if action.action == "space" and "spatial.read" in capabilities:
             tools["read_scene"] = ReadTool({
                 "name": "read_scene", "description": "Read the committed scene or a retained frame.",
-                "parameters": {"type": "object", "properties": {"frame": {"type": "integer", "minimum": 0}},
-                               "additionalProperties": False},
+                "parameters": {"type": "object", "properties": {
+                    "frame": {"type": "integer", "minimum": 0},
+                    "operation": {"type": "string", "enum": list(_SPATIAL_PARAMS)},
+                    "parameters": {"type": "object", "description": (
+                        "W4 options by operation: " + json.dumps(
+                            {op: sorted(keys) for op, keys in _SPATIAL_PARAMS.items()}
+                        )
+                    )},
+                }, "additionalProperties": False},
             }, lambda args: self._read_scene(args, text, caller))
-        if action.action == "space" and "observe" in capabilities:
+        if action.action == "space" and {"observe", "spatial.read"} <= capabilities:
             tools["observe_view"] = ReadTool({
                 "name": "observe_view", "description": "Read an approved image from the committed frame.",
-                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                "parameters": {"type": "object", "properties": {
+                    "view_id": {"type": "string"}, "frame": {"type": "integer", "minimum": 0},
+                }, "required": ["view_id"], "additionalProperties": False},
             }, lambda args: self._read_scene(args, text, caller, view=True))
         if action.action == "run_qa" and "run.read" in capabilities:
             tools["read_run"] = ReadTool({
                 "name": "read_run", "description": "Read your run's execution status and confirmed frontiers.",
                 "parameters": {"type": "object", "properties": {"run_id": {"type": "string"}},
                                "required": ["run_id"], "additionalProperties": False},
-            }, lambda args: (
-                self._control("status", args["run_id"], caller, read_only=True)
-                if set(args) == {"run_id"} and isinstance(args["run_id"], str)
-                else {"outcome": "forbidden"}, None
-            ))
+            }, lambda args: (self._read_run(args, caller), None))
 
         identity = {"user_id": caller.user_id, "conversation_id": caller.conversation_id, **caller.world, "role": role}
         scope = hashlib.sha256(json.dumps([identity, self._release], sort_keys=True).encode()).hexdigest()
@@ -308,27 +351,85 @@ class PsmManager:
                 role, scope, text, system_prompt=_QA_PROMPT, model=model.model, scoped=session,
             )
 
+    def _read_run(self, arguments: dict, caller: Caller) -> dict:
+        if set(arguments) != {"run_id"} or not isinstance(arguments["run_id"], str):
+            return {"outcome": "forbidden"}
+        run_id = arguments["run_id"]
+        status = self._control("status", run_id, caller, read_only=True)
+        if status["kind"] == "error":
+            return status
+        reader = self.host.read_queries(caller.restrict("run.read"), None)
+        result = self._read_policy.run(
+            reader=reader, operation="run_history", parameters={"run_id": run_id}, include_native=True,
+        )
+        if result["reply"]["outcome"] == "ok":
+            retained = result.get("details")
+            if isinstance(retained, dict) and retained.get("kind") == "run_status":
+                return _safe_run(retained, caller, "status", run_id, read_only=True)
+        return status
+
+    @staticmethod
+    def _scene_value(details, caller: Caller, publication: dict) -> dict | None:
+        present = {**caller.world, "frame": publication["frame"]}
+        if not isinstance(details, dict) or any(
+            key in details and details[key] != value for key, value in present.items()
+        ):
+            return None
+        summary = scene_projection(details, caller.world, publication["frame"])
+        if summary is not None:
+            return summary
+        approved = w4_details(details)
+        if approved:
+            return {**caller.world, "frame": publication["frame"], "details": approved}
+        return None
+
     def _read_scene(self, arguments: dict, question: str, caller: Caller, *, view=False):
         frame = arguments.get("frame")
-        if (set(arguments) - {"frame"} or "frame" in arguments and (type(frame) is not int or frame < 0)
-                or view and arguments):
+        if "frame" in arguments and (type(frame) is not int or frame < 0):
             return {"outcome": "forbidden"}, None
+        if view:
+            view_id = arguments.get("view_id")
+            if set(arguments) - {"frame", "view_id"} or not public_id(view_id):
+                return {"outcome": "forbidden"}, None
+            operation, parameters = "view", {"view_id": view_id, "include_image": True}
+            caller = caller.restrict("observe", "spatial.read")
+        else:
+            operation = arguments.get("operation", "scene_overview")
+            parameters = arguments.get("parameters", {})
+            if (set(arguments) - {"frame", "operation", "parameters"}
+                    or not isinstance(operation, str) or operation not in _SPATIAL_PARAMS
+                    or not isinstance(parameters, dict) or set(parameters) - _SPATIAL_PARAMS[operation]
+                    or any(type(item) not in (str, bool, int)
+                           or isinstance(item, str) and len(item) > 256 for item in parameters.values())):
+                return {"outcome": "forbidden"}, None
+            caller = caller.restrict("spatial.read")
+        if frame is not None:
+            parameters = {**parameters, "requested_frame": frame}
         request = {"kind": "spatial_read", **caller.world, "question": question, "requested_frame": frame}
-        # W1 supplies the exact public receipt. W4 can answer only from that committed view.
-        caller = caller.restrict("observe" if view else "spatial.read")
         approved = self.host.publication(request, caller)
         if not approved:
             return {"outcome": "not_retained"}, None
         if approved.get("scene_id") != caller.scene_id or approved.get("episode_id") != caller.episode_id:
             return {"outcome": "stale"}, None
-        reply, image, raw = self.host.spatial_read(request, caller, view=view)
-        if reply.get("kind") != "spatial_reply":
-            return {"outcome": "forbidden"}, None
+
+        reader = self.host.read_queries(caller, request)
+        image = None
+        if view:
+            received = reader.query(operation, **parameters)
+            data = received.for_agent(include_native=True)
+            if received.image is not None:
+                image = ApprovedImage("image/png", received.image, data["details"].get("attachment_sha256", ""))
+        else:
+            data = self._read_policy.run(reader=reader, operation=operation, parameters=parameters, include_native=True)
+        reply = data["reply"]
         outcome = reply.get("outcome")
         if outcome not in ("ok", "ambiguous"):
             return {"outcome": outcome if outcome in ("unknown", "stale", "not_retained", "forbidden") else "forbidden"}, None
+
         publication = project_publication(approved, reply.get("publication"))
-        if publication is None or frame is not None and publication["frame"] != frame:
+        if (publication is None or data.get("environment_id") != caller.environment_id
+                or frame is not None and publication["frame"] != frame
+                or image is not None and publication["views_sha256"] is None):
             return {"outcome": "stale"}, None
         identifiers = reply.get("entity_ids", [])
         answer = reply.get("answer")
@@ -336,22 +437,22 @@ class PsmManager:
             public_id(item) for item in identifiers
         ):
             return {"outcome": "forbidden"}, None
-        # 'answer' is W4's typed public response. Never forward raw ref, nested audit data or paths.
-        projected = {"outcome": outcome, "answer": answer[:2_000],
-                     "entity_ids": identifiers[:16], "publication": publication}
-        value = scene_projection(raw, caller.world, publication["frame"])
-        if value is not None:
-            digest = projection_sha(value)
-            with self._monitor_lock:
-                address = (caller, digest)
-                self._evidence[address] = (publication, value)
-                self._evidence.move_to_end(address)
-                if len(self._evidence) > 128:
-                    self._evidence.popitem(last=False)
-            projected["evidence"] = [{"ref": f"/evidence/{digest}", "sha256": digest}]
+        projected = {"outcome": outcome, "answer": answer[:2_000], "entity_ids": identifiers[:16],
+                     "publication": publication}
+        value = self._scene_value(data.get("details"), caller, publication)
+        artifacts = reply.get("evidence", [])
+        if value:
             projected["scene"] = value
-        if view and outcome == "ok" and image is not None:
-            if publication["views_sha256"] is None or project_publication(approved, image.get("publication")) is None:
-                return {"outcome": "stale"}, None
-            return projected, ApprovedImage(image["mime"], image["content"], image["sha256"])
-        return projected, None
+        if value and isinstance(artifacts, list) and len(artifacts) == 1:
+            artifact = artifacts[0]
+            handle = artifact.get("sha256", "") if isinstance(artifact, dict) else ""
+            if re.fullmatch(r"[0-9a-f]{64}", handle) and artifact.get("ref") == f"w4-projection:{handle}":
+                digest = projection_sha(value)
+                with self._monitor_lock:
+                    address = (caller, digest)
+                    self._evidence[address] = SpatialEvidence(publication, request, operation, parameters, artifact)
+                    self._evidence.move_to_end(address)
+                    if len(self._evidence) > 128:
+                        self._evidence.popitem(last=False)
+                projected["evidence"] = [{"ref": f"/evidence/{digest}", "sha256": digest}]
+        return projected, image if outcome == "ok" else None

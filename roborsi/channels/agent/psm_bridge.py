@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from roborsi.agents.roles import manager_chat
 from roborsi.agents.roles.manager.psm import PsmManager, Route, route
-from roborsi.agents.sessions.psm import ProviderError
+from roborsi.agents.sessions.psm import ProviderError, ReadAuthorizationExpired
 from roborsi.embodied.agent_loop import get_backend
 from roborsi.embodied.agent_loop.psm_config import LOOPBACK, PsmConfig
 from roborsi.embodied.skills import PSM_NAMESPACE
@@ -142,6 +142,8 @@ def create_app(config: PsmConfig) -> FastAPI:
             return {"route": action.action, "record": response}
         except HTTPException:
             raise
+        except ReadAuthorizationExpired as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from None
         except ProviderError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from None
         except Exception:

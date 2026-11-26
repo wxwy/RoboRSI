@@ -214,6 +214,17 @@ class PsmManager:
                         capabilities=frozenset(current["capabilities"]), authorization_epoch=epoch)
         return caller, current
 
+    def _read_authorization_is_current(self, caller: Caller) -> bool:
+        current = self.backend.current()
+        epoch = current.get("authorization_epoch")
+        if epoch is None and caller.authorization_epoch is None:
+            # Hosts with static authorization can omit the epoch.
+            return True
+        return (epoch == caller.authorization_epoch
+                and current.get("user_id") == caller.user_id
+                and all(current.get(key) == value for key, value in caller.world.items())
+                and (caller.capabilities & _QA_READS).issubset(current["capabilities"]))
+
     def operate(self, action: Route, caller: Caller, current: dict,
                 submission_id: str | None = None, entity_id: str | None = None) -> dict:
         capability = "run.submit" if action.action == "run" else "run.stop" if action.action == "stop" else "run.read"
@@ -271,7 +282,7 @@ class PsmManager:
         request = {**stored.request, "requested_frame": stored.publication["frame"]}
         allowed = ("observe", "spatial.read") if stored.operation == "view" else ("spatial.read",)
         caller = caller.restrict(*allowed)
-        if caller.capabilities != frozenset(allowed):
+        if caller.capabilities != frozenset(allowed) or not self._read_authorization_is_current(caller):
             return None
         receipt = self.host.publication(request, caller)
         if project_publication(receipt, stored.publication) is None:
@@ -288,7 +299,9 @@ class PsmManager:
                 or project_publication(receipt, reply.get("publication")) is None):
             return None
         value = self._scene_value(stored.operation, resolved.get("details"), caller, stored.publication)
-        return value if value and projection_sha(value) == digest else None
+        if value and projection_sha(value) == digest and self._read_authorization_is_current(caller):
+            return value
+        return None
 
     def monitor(self, caller: Caller, current: dict) -> dict:
         view = {
@@ -364,6 +377,7 @@ class PsmManager:
         session = ScopedRole(
             role, self.config.state / "roles" / scope / "workspace", model, tools, context,
             mock_provider=getattr(self.host, "mock_provider", None),
+            is_authorized=lambda: self._read_authorization_is_current(caller),
         )
         with use_run_mode("frozen"):
             return persistent_agent.run_role(
@@ -469,6 +483,8 @@ class PsmManager:
         artifacts = reply.get("evidence", [])
         if value:
             projected["scene"] = value
+        if not self._read_authorization_is_current(caller):
+            return {"outcome": "stale"}, None
         if value and isinstance(artifacts, list) and len(artifacts) == 1:
             artifact = artifacts[0]
             handle = artifact.get("sha256", "") if isinstance(artifact, dict) else ""

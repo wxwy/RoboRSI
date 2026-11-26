@@ -20,6 +20,10 @@ class ProviderError(RuntimeError):
     """The bridge reports the failure without serializing a provider response."""
 
 
+class ReadAuthorizationExpired(PermissionError):
+    """The Host invalidated the read snapshot while a turn was in progress."""
+
+
 @dataclass(frozen=True)
 class ApprovedImage:
     mime: str
@@ -51,6 +55,11 @@ class ScopedRole:
     tools: dict[str, ReadTool]
     context: dict
     mock_provider: Callable | None = None
+    is_authorized: Callable[[], bool] | None = None
+
+    def _require_authorization(self) -> None:
+        if self.is_authorized is not None and not self.is_authorized():
+            raise ReadAuthorizationExpired("Agent read authorization expired")
 
     def turn(self, system: str, user: str) -> str:
         from roborsi.agents.sessions.persistent_agent import _read_json, _write_json
@@ -59,16 +68,19 @@ class ScopedRole:
         history = self.workspace / "history.json"
         with (self.workspace / "turn.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            self._require_authorization()
             turns = _read_json(history).get("turns", [])
             initial_history = "same_episode" if turns else "empty"
             messages = [{"role": "system", "content": system}, *turns, {"role": "user", "content": user}]
             answer = asyncio.run(self._complete(messages))
+            self._require_authorization()
             # Tool payloads, raw evidence, images, and provider reasoning never seed another turn.
             turns += [{"role": "user", "content": user}, {"role": "assistant", "content": answer}]
             _write_json(history, {"turns": turns[-12:]})
             _write_json(self.workspace / "context.json", {
                 **self.context, "initial_history": initial_history, "history_ref": "history.json",
             })
+        self._require_authorization()
         return answer
 
     async def _complete(self, messages: list[dict]) -> str:
@@ -91,7 +103,9 @@ class ScopedRole:
 
     async def _chat(self, provider, messages: list[dict]) -> str:
         specs = [{"type": "function", "function": tool.spec} for tool in self.tools.values()]
+        self._require_authorization()
         response = await provider.chat(messages, tools=specs, model=self.model.model, temperature=0.0)
+        self._require_authorization()
         if response.finish_reason == "error":
             raise ProviderError("Agent provider request failed")
         if response.tool_calls:
@@ -108,7 +122,9 @@ class ScopedRole:
             })
             images = []
             for call in calls:
+                self._require_authorization()
                 data, image = self.tools[call.name].read(call.arguments)
+                self._require_authorization()
                 messages.append({
                     "role": "tool", "tool_call_id": call.id,
                     "content": json.dumps(data, ensure_ascii=False),
@@ -120,6 +136,7 @@ class ScopedRole:
                     {"type": "text", "text": "Approved views for the cited committed publication."},
                     *images,
                 ]})
+            self._require_authorization()
             response = await provider.chat(messages, model=self.model.model, temperature=0.0)
         if response.tool_calls or response.finish_reason != "stop" or not response.content:
             raise ProviderError("Agent provider returned an incomplete answer")

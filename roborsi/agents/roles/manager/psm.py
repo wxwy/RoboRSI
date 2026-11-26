@@ -21,7 +21,7 @@ from roborsi.embodied.skills import PSM_NAMESPACE, discover_ns
 from roborsi.runtime_mode import use_run_mode
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
-_NEGATED = re.compile(r"不要|别执行|别关|不执行|do not|don['’]t|never execute", re.I)
+_NEGATED = re.compile(r"(?<!要)不要|别执行|别关|不执行|do not|don['’]t|never execute", re.I)
 _QUESTION = re.compile(r"[?？]|^\s*(?:解释|说明|什么是|what\b|how\b|why\b|can\b|could\b|should\b)", re.I)
 _COMPOUND = re.compile(r"[;；]|，\s*再|然后|\band then\b|\bthen\b", re.I)
 _FRONTIERS = ("completed_frontier", "consumed_frontier", "reconciliation")
@@ -32,7 +32,8 @@ _REASONS = {"ordinary_stop", "official_latch", "official_terminal", "budget_exha
             "deadline", "unbound", "unsupported", "infrastructure", "reconcile_required",
             "reconciliation_required", "uncertain", "emergency_stop", "policy_error",
             "capability", "stale_identity", "normal", "episode_ended", "official_horizon",
-            "action_outcome_unknown", "physical_unknown", "user_budget_exhausted"}
+            "action_outcome_unknown", "physical_unknown", "user_budget_exhausted",
+            "action_steps", "wall_ms", "environment_terminal_partial_chunk"}
 _STATES = {"accepted", "running", "stopping", "ended"}
 _QA_PROMPT = (
     "You are RoboRSI's Frozen Manager. Reply in the operator's language. "

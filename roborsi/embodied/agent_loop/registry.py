@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from roborsi.embodied.agent_loop.env import Backend, BackendUnavailable
+from roborsi.embodied.skills import PSM_NAMESPACE
 
 
 _REGISTRY: dict[str, Callable[[], Backend]] = {}
@@ -83,6 +84,12 @@ def _load_libero() -> Backend:
     return be
 
 
+def _load_psm() -> Backend:
+    from roborsi.embodied.agent_loop.psm_backend import PsmBackend
+    return PsmBackend()
+
+
+register(PSM_NAMESPACE, _load_psm)
 register("robotwin", _load_robotwin)
 register("robotwin-http", _load_robotwin_http)
 register("bicoord", _load_bicoord)

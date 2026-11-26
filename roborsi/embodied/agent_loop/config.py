@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 
+from roborsi.embodied.agent_loop.env import BackendUnavailable
+from roborsi.embodied.skills import PSM_NAMESPACE
+
 DEFAULT_MODEL = (
     os.environ.get("ROBORSI_VLM_MODEL")
     or "anthropic/claude-opus-4-8"
@@ -19,19 +22,28 @@ DEFAULT_MODEL = (
 # share one embodiment's muscle (RoboTwin + its BiCoord fork + the HTTP shim all
 # use the dual-arm "robotwin" skills; the two LIBERO backends share the single-
 # arm "libero" muscle). Tool discovery / dispatch resolve the namespace from the
-# active Env's backend_name via _skill_namespace; default "robotwin" keeps every
-# existing caller byte-identical.
+# active Env's backend_name via _skill_namespace. Only an absent legacy
+# backend defaults to RoboTwin.
 _BACKEND_SKILL_NS = {
     "robotwin": "robotwin",
     "robotwin-http": "robotwin",
     "bicoord": "robotwin",
     "libero": "libero",
     "libero-pro": "libero",
+    "robocasa": "robotwin",  # Upstream RoboCasa reuses the existing base-skill catalog.
+    PSM_NAMESPACE: PSM_NAMESPACE,
 }
 
 
 def _skill_namespace(backend_name: str | None) -> str:
-    return _BACKEND_SKILL_NS.get(backend_name or "", "robotwin")
+    if backend_name is None:
+        if os.environ.get("ROBORSI_PSM_CONFIG"):
+            raise BackendUnavailable("an explicit PSM backend is required")
+        return "robotwin"
+    try:
+        return _BACKEND_SKILL_NS[backend_name]
+    except KeyError as exc:
+        raise BackendUnavailable(f"unknown skill namespace for backend {backend_name!r}") from exc
 
 
 SYSTEM_PROMPT_LEGACY = """\

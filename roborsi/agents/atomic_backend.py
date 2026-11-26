@@ -1,4 +1,4 @@
-"""Atomic-task → (backend, sim-task) resolution for the 3-role path.
+"""Atomic-task to (backend, sim-task) resolution for the 3-role path.
 
 The 3-role atomic pipeline (``run_atomic_episode``) historically assumed the
 RoboTwin backend: the atomic NAME doubled as the sim env name and the Engineer
@@ -63,20 +63,30 @@ def resolve(atomic: str) -> AtomicBackend:
         ``libero_object_object/0``. Defaults to SKILL.md ``libero_task``.
     """
     import os
-    from roborsi.embodied.skills import get as get_skill
+    from roborsi.embodied.agent_loop import BackendUnavailable, list_backends
+    from roborsi.embodied.skills import PSM_NAMESPACE, get as get_skill
 
     meta = _skill_metadata(atomic, get_skill)
     backends = meta.get("backends")
-    backend = backends[0] if isinstance(backends, list) and backends else "robotwin"
+    if backends is not None and (
+        not isinstance(backends, list) or not backends
+        or any(not isinstance(name, str) or name not in list_backends() for name in backends)
+    ):
+        raise BackendUnavailable(f"invalid backend declaration for atomic {atomic!r}: {backends!r}")
+    backend = backends[0] if backends else "robotwin"
+    if os.environ.get("ROBORSI_PSM_CONFIG") and backend != PSM_NAMESPACE:
+        raise BackendUnavailable("PSM uses the W2 runner, not a legacy atomic backend")
 
     if backend in _LIBERO_BACKENDS:
         backend = os.environ.get("ROBORSI_LIBERO_BACKEND", backend)
+        if backend not in _LIBERO_BACKENDS:
+            raise BackendUnavailable(f"unknown LIBERO backend {backend!r}")
         sim_task = os.environ.get(
             "ROBORSI_LIBERO_TASK", str(meta.get("libero_task") or atomic)
         ).strip()
         return AtomicBackend(backend_name=backend, sim_task=sim_task)
 
-    return AtomicBackend(backend_name="robotwin", sim_task=atomic)
+    return AtomicBackend(backend_name=backend, sim_task=atomic)
 
 
 def _skill_metadata(atomic: str, get_skill) -> dict:

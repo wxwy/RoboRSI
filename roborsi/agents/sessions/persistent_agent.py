@@ -18,6 +18,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from roborsi.agents.sessions.psm import ScopedRole
 
 from roborsi.agents.sessions._codex_autoloop.codex_runner import (
     CodexRunner, RunnerOptions,
@@ -208,12 +212,19 @@ def _roll(role: str, task: str, *, model: str, backend: str) -> None:
 
 def run_role(role: str, task: str, user_block: str, *,
              system_prompt: str, model: str,
-             images: list[str] | None = None) -> str:
+             images: list[str] | None = None, scoped: ScopedRole | None = None) -> str:
     """Role turn text — persistent session by default, or the stateless one-shot
     when ROBORSI_ROLE_SESSION=0 (instant rollback for the live campaign).
 
     Centralises the gate so Planner and Reviewer share one dispatch. The fallback
     reproduces the pre-session [system, user] → _call_vlm_tools → text path."""
+    if scoped is not None:
+        from roborsi.runtime_mode import evaluation_prompt, is_eval_mode
+
+        if scoped.role != role or scoped.model.model != model or images or not is_eval_mode():
+            raise ValueError("invalid Frozen API role scope")
+        return scoped.turn(system_prompt + "\n\n" + evaluation_prompt(), user_block)
+
     from roborsi.agents.roles.role_skills import ROLES, with_role_skills
     from roborsi.runtime_mode import evaluation_prompt, is_eval_mode
     if role in ROLES:

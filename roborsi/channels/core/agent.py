@@ -1819,6 +1819,9 @@ def handle_user_message(text: str, target_chat_id: str | None = None,
     selfevo). On return, ``history`` reflects the conversation including
     this turn's tool calls and the assistant's final reply.
     """
+    if os.environ.get("ROBORSI_PSM_CONFIG"):
+        return "The Frozen PSM profile requires the authenticated local Manager bridge."
+
     from roborsi.embodied.agent_loop.config import DEFAULT_MODEL
     from roborsi.embodied.agent_loop.vlm_io import _call_vlm_tools
     from roborsi.channels.agent.feishu.live_trace import get_session, AgentInterrupted

@@ -12,6 +12,7 @@ Manager session so they don't interleave / corrupt the thread.
 from __future__ import annotations
 
 import fcntl
+import os
 from pathlib import Path
 
 from roborsi.agents.sessions import persistent_agent
@@ -34,11 +35,20 @@ def list_sessions() -> list[str]:
     return ["manager"]
 
 
-def reply(text: str, session: str | None = None) -> str:
+def reply(text: str, session: str | None = None, *, scoped=None) -> str:
+    if scoped is not None:
+        manager, action, caller, current = scoped
+        return manager.answer(action, text, caller, current)
+    return _legacy_reply(text, session)
+
+
+def _legacy_reply(text: str, session: str | None = None) -> str:
     """One Manager turn for an operator message, in the same persistent
     ``manager:manager`` session the review cycle uses, so the Manager keeps one
     memory. flock serialises concurrent messages. ``session`` is accepted for
     the dashboard's API and ignored."""
+    if os.environ.get("ROBORSI_PSM_CONFIG"):
+        raise RuntimeError("PSM Manager requires the authenticated local bridge")
     _LOCK.parent.mkdir(parents=True, exist_ok=True)
     with open(_LOCK, "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)

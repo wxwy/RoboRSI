@@ -25,6 +25,7 @@ from typing import Any
 
 
 SHIPPED_ROOT = Path(__file__).resolve().parent
+PSM_NAMESPACE = "psm_wma"
 
 
 def user_root() -> Path:
@@ -172,6 +173,13 @@ def discover_ns(ns: str) -> list[Skill]:
     muscle. Tool discovery / dispatch resolve base skills through this instead,
     passing the active backend's namespace, so same-named skills coexist across
     embodiments."""
+    if ns == PSM_NAMESPACE:
+        root = SHIPPED_ROOT / "base" / PSM_NAMESPACE
+        return [
+            skill for skill in _discover_root(root, False)
+            if skill.path.resolve().is_relative_to(root)
+        ]
+
     out: list[Skill] = []
     seen: set[str] = set()
     # A skill revised for the running task only (task_local/<task>/base/...)

@@ -154,25 +154,37 @@ def main(
     ),
 ):
     """RoboRSI robot self-evolution harness. Bare `roborsi` opens the Manager cockpit."""
+    psm = os.environ.get("ROBORSI_PSM_CONFIG")
+    if psm and ctx.invoked_subcommand not in (None, "tui"):
+        raise typer.BadParameter("Use the authenticated PSM cockpit through 'roborsi' or 'roborsi tui'.")
     if ctx.invoked_subcommand is None:
-        _launch_tui()
+        port = int(os.environ.get("PSM_AGENT_PORT", "8791")) if psm else 8791
+        _launch_tui(port=port)
 
 
 def _launch_tui(host: str = "127.0.0.1", port: int = 8791,
-                no_bridge: bool = False) -> None:
-    """Open the Ink Manager cockpit (delegates to the stdlib-only launcher)."""
+                no_bridge: bool = False, **options) -> None:
     from roborsi.cli.tui_launch import launch
-    launch(host=host, port=port, no_bridge=no_bridge)
+
+    launch(host=host, port=port, no_bridge=no_bridge, **options)
 
 
 @app.command()
 def tui(
     host: str = typer.Option("127.0.0.1", help="Dashboard bridge host."),
-    port: int = typer.Option(8791, help="Dashboard bridge port."),
-    no_bridge: bool = typer.Option(False, help="Don't auto-start the bridge (connect to an existing one)."),
+    port: int = typer.Option(8791, envvar="PSM_AGENT_PORT", min=1, max=65535),
+    no_bridge: bool = typer.Option(False, help="Connect to an existing bridge."),
+    serve: bool = typer.Option(False, help="Run the Frozen PSM bridge in the foreground."),
+    message: str | None = typer.Option(None, help="Send one PSM turn and print JSON."),
+    monitor: bool = typer.Option(False, help="Print the current PSM runtime snapshot."),
+    watch: bool = typer.Option(False, help="Watch changes to the PSM runtime snapshot."),
+    session: str = typer.Option("direct", help="PSM conversation id."),
+    submission_id: str | None = typer.Option(None, help="Stable request id for retrying a PSM submit."),
+    entity_id: str | None = typer.Option(None, help="Optional public entity hint for a PSM submit."),
 ) -> None:
-    """Open the RoboRSI Manager cockpit (Ink terminal UI)."""
-    _launch_tui(host=host, port=port, no_bridge=no_bridge)
+    """Open the RoboRSI Manager cockpit."""
+    _launch_tui(host=host, port=port, no_bridge=no_bridge, serve=serve, text=message,
+                monitor=monitor, watch=watch, session=session, submission_id=submission_id, entity_id=entity_id)
 
 
 @app.command()

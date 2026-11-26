@@ -75,29 +75,107 @@ def projection_sha(value: dict) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
 
-# The W4 policy constructs its own first projection. The bridge admits only
-# these fields, including at nested levels, before passing it to the Provider.
-_DETAIL_FIELDS = frozenset("""
-world_frame geometry_source rooms room_count object_count robot_room_uid views_published
-robot_pose position_world forward_world rows match_count omitted_count id name uid room_uid
-island_id kind source_category_id source_instance_id source_part_id category bbox_m bbox
-bbox_world min max center center_world source relation target basis distance_m bbox_gap_m
-view_id view_ids availability owner_frame image_sha256 pixel_sha256 projection_id
-attachment_sha256 projection width height resolution meters_per_pixel m_per_pixel uv
-plane right_world up_world origin_world binding_id task_binding_id role_candidates role
-entity_id same_label_candidates text label
-""".split())
+# C4 has already projected the source. Apply a second allowlist for the
+# specific operation, including the shape of each nested map and array.
+_NUMBER = (int, float)
+_VECTOR = [_NUMBER]
+_ROOM = {"id": str, "uid": int, "name": str, "center_world": _VECTOR}
+_ENTITY = {
+    "id": str,
+    "kind": str,
+    "label": str,
+    "source_instance_id": str,
+    "source_part_id": str,
+    "source_category_id": str,
+    "room_uid": int,
+    "island_id": str,
+    "bbox_min": _VECTOR,
+    "bbox_max": _VECTOR,
+}
+_ROW_COUNTS = {"match_count": int, "omitted_count": int}
+_DETAIL_FIELDS = {
+    "scene_overview": {
+        "world_frame": str,
+        "geometry_source": str,
+        "rooms": [_ROOM],
+        "room_count": int,
+        "object_count": int,
+        "robot_room_uid": int,
+        "views_published": bool,
+        "robot_pose": {"position_world": _VECTOR, "forward_world": _VECTOR},
+    },
+    "rooms": {"rows": [_ROOM], **_ROW_COUNTS},
+    "entities": {"rows": [_ENTITY], **_ROW_COUNTS},
+    "relation": {
+        "source": str,
+        "relation": str,
+        "target": str,
+        "basis": str,
+        "bbox_gap_m": _NUMBER,
+    },
+    "list_views": {"view_ids": [str], "basis": str, **_ROW_COUNTS},
+    "initial_context": {
+        "basis": str,
+        "role_candidates": [{
+            "entity_id": str,
+            "name": str,
+            "role": str,
+            "room_uid": int,
+            "same_label_candidates": int,
+        }],
+        "omitted_candidates": int,
+    },
+    "view": {
+        "view_id": str,
+        "canonical_view_id": str,
+        "variant": str,
+        "is_floor_top": bool,
+        "image_sha256": str,
+        "pixel_sha256": str,
+        "attachment_sha256": str,
+        "owner_frame": int,
+        "membership_version": str,
+        "room_uid": int,
+        "island_id": str,
+        "projection": {
+            "projection_id": str,
+            "kind": str,
+            "axis": str,
+            "units": str,
+            "right_world": _VECTOR,
+            "up_world": _VECTOR,
+            "forward_world": _VECTOR,
+            "width_px": _NUMBER,
+            "height_px": _NUMBER,
+            "meters_per_pixel": _NUMBER,
+            "pixel_center_offset": _NUMBER,
+            "uv_min_room": _VECTOR,
+            "rows_flipped": bool,
+            "reference_frame": {"origin_world": _VECTOR, "axes_world": [_VECTOR]},
+        },
+    },
+}
 
 
-def w4_details(value, depth: int = 0):
-    if depth >= 7:
+def _project(value, fields):
+    if isinstance(fields, dict):
+        if not isinstance(value, dict):
+            return None
+        return {key: _project(value[key], rule) for key, rule in fields.items() if key in value}
+    if isinstance(fields, list):
+        if not isinstance(value, (list, tuple)):
+            return None
+        return [_project(item, fields[0]) for item in value[:16]]
+    types = fields if isinstance(fields, tuple) else (fields,)
+    if type(value) not in types:
         return None
-    if isinstance(value, dict):
-        return {key: w4_details(item, depth + 1) for key, item in value.items() if key in _DETAIL_FIELDS}
-    if isinstance(value, (list, tuple)):
-        return [w4_details(item, depth + 1) for item in value[:16]]
-    if isinstance(value, str):
+    if type(value) is str:
         return value[:256]
-    if type(value) in (int, float) and abs(value) < 1e12 and math.isfinite(value):
-        return value
-    return value if type(value) is bool else None
+    if type(value) in (int, float) and not (-1e12 < value < 1e12):
+        return None
+    return value
+
+
+def w4_details(operation: str, value) -> dict | None:
+    fields = _DETAIL_FIELDS.get(operation)
+    return _project(value, fields) if fields is not None else None

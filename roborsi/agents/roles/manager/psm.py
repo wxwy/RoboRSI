@@ -35,8 +35,11 @@ _REASONS = {"ordinary_stop", "official_latch", "official_terminal", "budget_exha
             "reconciliation_required", "uncertain", "emergency_stop", "policy_error",
             "capability", "stale_identity", "normal", "episode_ended", "official_horizon",
             "action_outcome_unknown", "physical_unknown", "user_budget_exhausted",
-            "action_steps", "wall_ms", "environment_terminal_partial_chunk"}
+            "action_steps", "wall_ms", "environment_terminal_partial_chunk",
+            "action_grant_unresolved", "action_rejected", "incompatible",
+            "prediction_or_run_deadline", "replans", "transport_retries"}
 _STATES = {"accepted", "running", "stopping", "ended"}
+_QA_READS = frozenset({"skill.read", "observe", "spatial.read", "run.read"})
 _SPATIAL_PARAMS = {
     "scene_overview": {"include_robot_pose"},
     "rooms": {"selector", "limit"},
@@ -152,7 +155,9 @@ def _safe_run(record: dict, caller: Caller, operation: str, run_id: str | None =
         return _error("infrastructure", operation)
     f, consumed, reconciliation = (record.get(field) for field in _FRONTIERS)
     if (type(f) is not int or type(consumed) is not int or not 0 <= consumed <= f
-            or reconciliation not in ("clear", "pending", "required")):
+            or reconciliation not in ("clear", "pending", "required")
+            or reconciliation == "clear" and consumed != f
+            or reconciliation == "pending" and consumed == f):
         return _error("infrastructure", operation)
     projected.update(_pick(record, _FRONTIERS))
     if kind == "run_status":
@@ -160,7 +165,8 @@ def _safe_run(record: dict, caller: Caller, operation: str, run_id: str | None =
             return _error("infrastructure", operation)
         return {**projected, "state": record["state"]}
     execution, reason = record.get("execution"), record.get("reason")
-    if execution not in ("completed", "stopped", "failed", "budget_exhausted"):
+    if (execution not in ("completed", "stopped", "failed", "budget_exhausted")
+            or reason in ("action_outcome_unknown", "reconcile_required") and reconciliation != "required"):
         return _error("infrastructure", operation)
     projected.update(execution=execution, reason=reason if isinstance(reason, str) and reason in _REASONS else "unspecified")
     if not read_only:
@@ -186,7 +192,7 @@ class PsmManager:
         self.config = config
         self._recent: dict[Caller, str] = {}
         self._monitor_lock = threading.Lock()
-        self._evidence: OrderedDict[tuple[Caller, str], SpatialEvidence] = OrderedDict()
+        self._evidence: OrderedDict[tuple[Caller, str | None, str], SpatialEvidence] = OrderedDict()
         self._read_policy = load_psm_read_policy()
         skills = discover_ns(PSM_NAMESPACE)
         self._skills = {skill.name: skill.description[:240] for skill in skills}
@@ -201,8 +207,11 @@ class PsmManager:
         if not re.fullmatch(_ID, conversation):
             raise ValueError("invalid conversation id")
         current = self.backend.current()
+        epoch = current.get("authorization_epoch")
+        if epoch is not None and (not isinstance(epoch, str) or not epoch):
+            raise ValueError("invalid host authorization epoch")
         caller = Caller(current["user_id"], conversation, **_pick(current, WORLD_FIELDS),
-                        capabilities=frozenset(current["capabilities"]))
+                        capabilities=frozenset(current["capabilities"]), authorization_epoch=epoch)
         return caller, current
 
     def operate(self, action: Route, caller: Caller, current: dict,
@@ -256,7 +265,7 @@ class PsmManager:
         if "spatial.read" not in current["capabilities"]:
             return None
         with self._monitor_lock:
-            stored = self._evidence.get((caller, digest))
+            stored = self._evidence.get((caller, caller.authorization_epoch, digest))
         if not stored:
             return None
         request = {**stored.request, "requested_frame": stored.publication["frame"]}
@@ -278,7 +287,7 @@ class PsmManager:
                 or resolved.get("environment_id") != caller.environment_id
                 or project_publication(receipt, reply.get("publication")) is None):
             return None
-        value = self._scene_value(resolved.get("details"), caller, stored.publication)
+        value = self._scene_value(stored.operation, resolved.get("details"), caller, stored.publication)
         return value if value and projection_sha(value) == digest else None
 
     def monitor(self, caller: Caller, current: dict) -> dict:
@@ -338,7 +347,14 @@ class PsmManager:
             }, lambda args: (self._read_run(args, caller), None))
 
         identity = {"user_id": caller.user_id, "conversation_id": caller.conversation_id, **caller.world, "role": role}
-        scope = hashlib.sha256(json.dumps([identity, self._release], sort_keys=True).encode()).hexdigest()
+        # A prior assistant reply can contain a legitimate tool result. Reuse
+        # history only for the same host grants and the same active read surface.
+        access = {
+            "epoch": caller.authorization_epoch,
+            "capabilities": sorted(caller.capabilities & _QA_READS),
+            "tools": sorted(tools),
+        }
+        scope = hashlib.sha256(json.dumps([identity, self._release, access], sort_keys=True).encode()).hexdigest()
         model = self.config.models[role]
         context = {
             "kind": "role_context", "mode": "frozen", **identity, "context_id": scope,
@@ -372,7 +388,7 @@ class PsmManager:
         return status
 
     @staticmethod
-    def _scene_value(details, caller: Caller, publication: dict) -> dict | None:
+    def _scene_value(operation: str, details, caller: Caller, publication: dict) -> dict | None:
         present = {**caller.world, "frame": publication["frame"]}
         if not isinstance(details, dict) or any(
             key in details and details[key] != value for key, value in present.items()
@@ -381,7 +397,7 @@ class PsmManager:
         summary = scene_projection(details, caller.world, publication["frame"])
         if summary is not None:
             return summary
-        approved = w4_details(details)
+        approved = w4_details(operation, details)
         if approved:
             return {**caller.world, "frame": publication["frame"], "details": approved}
         return None
@@ -406,6 +422,10 @@ class PsmManager:
                            or isinstance(item, str) and len(item) > 256 for item in parameters.values())):
                 return {"outcome": "forbidden"}, None
             caller = caller.restrict("spatial.read")
+            if operation == "initial_context":
+                if frame not in (0, None):
+                    return {"outcome": "unknown"}, None
+                frame = 0  # C4 initialization is always the exact admitted frame.
         if frame is not None:
             parameters = {**parameters, "requested_frame": frame}
         request = {"kind": "spatial_read", **caller.world, "question": question, "requested_frame": frame}
@@ -442,7 +462,7 @@ class PsmManager:
             return {"outcome": "forbidden"}, None
         projected = {"outcome": outcome, "answer": answer[:2_000], "entity_ids": identifiers[:16],
                      "publication": publication}
-        value = self._scene_value(data.get("details"), caller, publication)
+        value = self._scene_value(operation, data.get("details"), caller, publication)
         artifacts = reply.get("evidence", [])
         if value:
             projected["scene"] = value
@@ -452,7 +472,7 @@ class PsmManager:
             if re.fullmatch(r"[0-9a-f]{64}", handle) and artifact.get("ref") == f"w4-projection:{handle}":
                 digest = projection_sha(value)
                 with self._monitor_lock:
-                    address = (caller, digest)
+                    address = (caller, caller.authorization_epoch, digest)
                     self._evidence[address] = SpatialEvidence(publication, request, operation, parameters, artifact)
                     self._evidence.move_to_end(address)
                     if len(self._evidence) > 128:

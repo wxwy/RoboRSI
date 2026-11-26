@@ -23,6 +23,7 @@ class Caller:
     scene_id: str
     episode_id: str
     capabilities: frozenset[str] = field(default_factory=frozenset, compare=False, repr=False)
+    authorization_epoch: str | None = field(default=None, compare=False, repr=False)
 
     def restrict(self, *allowed: str) -> Caller:
         return replace(self, capabilities=self.capabilities.intersection(allowed))

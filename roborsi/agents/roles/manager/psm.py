@@ -23,6 +23,7 @@ from roborsi.runtime_mode import use_run_mode
 
 _ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
 _NEGATED = re.compile(r"(?<!要)不要|别执行|别关|不执行|do not|don['’]t|never execute", re.I)
+_SPACE_QUESTION = re.compile(r"在哪|何处|看见|where\b|observe\b|视图|show.*view", re.I)
 _QUESTION = re.compile(r"[?？]|^\s*(?:解释|说明|什么是|what\b|how\b|why\b|can\b|could\b|should\b)", re.I)
 _COMPOUND = re.compile(r"[;；]|，\s*再|然后|\band then\b|\bthen\b", re.I)
 _FRONTIERS = ("completed_frontier", "consumed_frontier", "reconciliation")
@@ -90,6 +91,8 @@ def route(text: str, current: dict) -> Route:
         return Route("status", natural_status[1])
     instruction = explicit[2] if explicit else text
     if _NEGATED.search(instruction):
+        if not explicit and _SPACE_QUESTION.search(instruction):
+            return Route("space")
         return Route("negated")
     if not explicit and re.search(r"\brun[-_]\w|\bfrontier\b|\brun status\b|运行进度|运行记录", instruction, re.I):
         return Route("run_qa")
@@ -105,7 +108,7 @@ def route(text: str, current: dict) -> Route:
         return Route("clarify_target")
     if re.search(r"那扇|那个|这个|that (?:door|object)", instruction, re.I):
         return Route("space")
-    if re.search(r"在哪|何处|看见|where\b|observe\b|视图|show.*view", instruction, re.I):
+    if _SPACE_QUESTION.search(instruction):
         return Route("space")
     return Route("skill")
 

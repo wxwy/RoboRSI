@@ -117,9 +117,10 @@ def create_app(config: PsmConfig) -> FastAPI:
         return manager.operate(Route("stop", run_id), *manager.context(session))
 
     @app.get("/evidence/{digest}", dependencies=secured)
-    def evidence(digest: Identifier, session: Identifier = "direct") -> dict:
-        value = manager.evidence(*manager.context(session), digest)
-        if value is None:
+    async def evidence(digest: Identifier, session: Identifier = "direct") -> dict:
+        caller, current = await run_in_threadpool(manager.context, session)
+        value = await run_in_threadpool(manager.evidence, caller, current, digest)
+        if value is None or not manager._read_authorization_is_current(caller):
             raise HTTPException(status_code=404, detail="Evidence is not available")
         return value
 
@@ -135,6 +136,8 @@ def create_app(config: PsmConfig) -> FastAPI:
                 read = partial(manager_chat.reply, body.text, body.session,
                                scoped=(manager, action, caller, current))
                 answer = await asyncio.get_running_loop().run_in_executor(app.state.qa_workers, read)
+                if not manager._read_authorization_is_current(caller):
+                    raise ReadAuthorizationExpired("Agent read authorization expired")
                 return {"route": action.action, "reply": answer}
             if action.action in _REPLIES:
                 return {"route": action.action, "reply": _REPLIES[action.action]}
